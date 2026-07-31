@@ -1,0 +1,98 @@
+networks:
+  labnet:
+    driver: bridge
+    internal: true   # no outbound internet from this network — recon/exploit agents cannot reach anything but the target and the datastores
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+  hostnet:
+    driver: bridge
+    # NOT internal — this is the only path from your host machine into the lab, for browser/CLI access
+    # (juice-shop, postgres, neo4j only). recon-agent stays off this network so its own traffic
+    # is still fully contained by labnet's internal:true isolation.
+
+services:
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: labnet-juice-shop
+    networks:
+      labnet:
+        ipv4_address: 172.28.0.10
+      hostnet: {}
+    ports:
+      - "3000:3000"   # host-only, for you to poke at it in a browser; does not grant the container internet access
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: labnet-postgres
+    environment:
+      POSTGRES_USER: vuln_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: vuln_agent
+    networks:
+      labnet:
+        ipv4_address: 172.28.0.20
+      hostnet: {}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vuln_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: labnet-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-changeme123}
+      NEO4J_PLUGINS: '[]'
+    networks:
+      labnet:
+        ipv4_address: 172.28.0.30
+      hostnet: {}
+    ports:
+      - "7474:7474"   # browser UI
+      - "7687:7687"   # bolt
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  recon-agent:
+    build:
+      context: ./agents/recon
+    container_name: labnet-recon-agent
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      juice-shop:
+        condition: service_started
+    environment:
+      TARGET_HOST: juice-shop
+      TARGET_PORT: "3000"
+      ALLOWED_TARGETS: "juice-shop,172.28.0.10"   # hardcoded allowlist — agent refuses to scan anything else
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: vuln_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: vuln_agent
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-changeme123}
+    networks:
+      labnet:
+        ipv4_address: 172.28.0.40
+    # runs once and exits; `docker compose run recon-agent` to re-trigger on demand
+
+volumes:
+  pg_data:
+  neo4j_data:
